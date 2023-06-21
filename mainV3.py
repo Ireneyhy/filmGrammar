@@ -121,6 +121,19 @@ def get_object(outputs, height, width, classes):
     return shot_scale, bounding_box, object, objectClass
 
 
+def get_movement(var_magnitudes, var_border_magnitudes, mean_motions_x, mean_motions_y):
+    movement = ""
+    if var_magnitudes is not None:
+        if var_border_magnitudes is None or var_border_magnitudes < 13:
+            return "STATIC"
+    else:
+        if abs(mean_motions_x) > 0.2:
+            movement += "PAN"
+        if abs(mean_motions_y) > 0.2:
+            movement += ", TILT"
+    return movement
+
+
 def track_movement(file):
     cap = cv2.VideoCapture(file)
 
@@ -155,11 +168,6 @@ def track_movement(file):
     motions_x = []
     motions_y = []
 
-    # Initialize additional lists to store the new data
-    transformed_magnitudes = []
-    transformed_motions_x = []
-    transformed_motions_y = []
-
     def is_border_point(point, border_size=20):
         # Checks if a point is within `border_size` pixels from the border of the frame.
         h, w = old_frame.shape[:2]
@@ -172,8 +180,6 @@ def track_movement(file):
         )
 
     is_border_point_vectorized = np.vectorize(is_border_point, signature="(n)->()")
-
-    transformed_mask = np.zeros_like(old_frame)
 
     while True:
         ret, frame = cap.read()
@@ -190,49 +196,17 @@ def track_movement(file):
         if p1 is not None:
             good_new = p1[st == 1]
             good_old = p0[st == 1]
-            good_old_transformed = good_old
-
-            if len(good_old) >= 8:
-                try:
-                    H, _ = cv2.findHomography(good_old, good_new, method=cv2.RANSAC)
-                    good_old_transformed = cv2.perspectiveTransform(
-                        good_old.reshape(-1, 1, 2), H
-                    )
-                except:
-                    print("Not enough points.")
-
-            matches_mask = mask.ravel().tolist()
-
-            # Draw only inliers
-            for i, (m, n) in enumerate(zip(good_old, good_new)):
-                if matches_mask[i] == 1:
-                    a, b = map(int, n.ravel())
-                    c, d = map(int, m.ravel())
-                    mask = cv2.line(mask, (a, b), (c, d), color[i].tolist(), 2)
-                    frame = cv2.circle(frame, (a, b), 5, color[i].tolist(), -1)
-
-            img1 = cv2.add(frame, mask)
 
             for i, (new, old) in enumerate(zip(good_new, good_old)):
-                a, b = map(int, new.ravel())
-                c, d = map(int, old.ravel())
-                mask = cv2.line(mask, (a, b), (c, d), color[i].tolist(), 2)
-                frame = cv2.circle(frame, (a, b), 5, color[i].tolist(), -1)
-
-            img = cv2.add(old_frame, mask)
-
-            # For transformed motion vectors
-            for i, (new, old) in enumerate(
-                zip(good_new, good_old_transformed.reshape(-1, 2))
-            ):
                 a, b = new.ravel().astype(int)
                 c, d = old.ravel().astype(int)
-                transformed_mask = cv2.line(
-                    transformed_mask, (c, d), (a, b), color[i].tolist(), 2
-                )
-                frame = cv2.circle(frame, (a, b), 5, color[i].tolist(), -1)
+                color_value = tuple(map(int, color[i]))
 
-            transformed_img = cv2.add(old_frame, transformed_mask)
+                # original vectors
+                mask = cv2.line(mask, (a, b), (c, d), color_value, 2)
+                old_frame = cv2.circle(old_frame, (a, b), 5, color_value, -1)
+
+            img = cv2.add(old_frame, mask)
 
             # Calculate motion vectors
             motion_vectors = good_new - good_old
@@ -249,27 +223,12 @@ def track_movement(file):
             motions_x.extend(motion_vectors[:, 0])
             motions_y.extend(motion_vectors[:, 1])
 
-            # Reshape good_old_transformed to have the same shape as good_new
-            good_old_transformed = good_old_transformed.reshape(good_new.shape)
-
-            # Calculate transformed motion vectors
-            transformed_motion_vectors = good_new - good_old_transformed
-            transformed_magnitudes.extend(
-                np.sqrt((transformed_motion_vectors**2).sum(-1))
-            )
-            transformed_motions_x.extend(transformed_motion_vectors[:, 0])
-            transformed_motions_y.extend(transformed_motion_vectors[:, 1])
-
             # Update the previous frame and previous points
             old_gray = frame_gray.copy()
             p0 = good_new.reshape(-1, 1, 2)
 
     # Save the result to an image
-    cv2.imwrite(os.path.splitext(file)[0] + "_original_vectors.png", img)
-
-    cv2.imwrite(os.path.splitext(file)[0] + "_transformed_vectors.png", transformed_img)
-
-    cv2.imwrite(os.path.splitext(file)[0] + "_inliers.png", img1)
+    cv2.imwrite(os.path.splitext(file)[0] + "_flow.png", img)
 
     cap.release()
 
@@ -300,48 +259,7 @@ def track_movement(file):
         print("Warning: `motions_y` is empty.")
         mean_motions_y = np.nan
 
-    return (
-        var_magnitudes,
-        var_border_magnitudes,
-        mean_motions_x,
-        mean_motions_y,
-        np.var(transformed_magnitudes),
-        np.mean(transformed_motions_x),
-        np.mean(transformed_motions_y),
-    )
-
-    # Load existing data
-    existing_df = pd.read_csv(csv_file)
-
-    # Replace blank data in the new DataFrame with np.nan
-    new_df.replace({"": np.nan}, inplace=True)
-
-    # Align columns of the two DataFrames
-    aligned_existing, aligned_new = existing_df.align(
-        new_df, join="outer", axis=1, fill_value=np.nan
-    )
-
-    # Update aligned existing DataFrame with the new one
-    aligned_existing.update(aligned_new)
-
-    # Find the intersection of the old and new data
-    common = aligned_existing[aligned_existing.filename.isin(new_df.filename)]
-
-    # Update the common part with the new data
-    aligned_existing.loc[common.index] = common
-
-    # Concatenate non-intersecting parts with the old data
-    updated_df = pd.concat(
-        [aligned_existing, new_df[~new_df.filename.isin(aligned_existing.filename)]]
-    )
-
-    # Ensure 'filename' column is the first one, and sort the rest alphabetically
-    updated_df = updated_df.reindex(
-        ["filename"] + sorted(updated_df.columns.drop("filename")), axis=1
-    )
-
-    # Write the updated DataFrame back to the csv file
-    updated_df.to_csv(csv_file, index=False)
+    return (var_magnitudes, var_border_magnitudes, mean_motions_x, mean_motions_y)
 
 
 def main():
@@ -441,7 +359,7 @@ def main():
     df_image = pd.DataFrame(data, columns=["filename", "contrast", "exposure", "scale"])
 
     # Get video files
-    directory = "/Users/heying/Documents/Grad_School/慶應/KMD/THESIS/Footage/videos/1"
+    directory = "/Users/heying/Documents/Grad_School/慶應/KMD/THESIS/Footage/videos/WIP"
     data = []
 
     if not fnmatch.filter(os.listdir(directory), "*.mp4"):
@@ -459,18 +377,23 @@ def main():
                     var_border_magnitudes,
                     mean_motions_x,
                     mean_motions_y,
-                    transformed_magnitudes,
-                    transformed_motions_x,
-                    transformed_motions_y,
                 ) = track_movement(file_path)
+
+                movement = get_movement(
+                    var_magnitudes,
+                    var_border_magnitudes,
+                    mean_motions_x,
+                    mean_motions_y,
+                )
 
                 data.append(
                     [
                         file_wo_extension,
-                        str(var_magnitudes) + "/" + str(transformed_magnitudes),
+                        var_magnitudes,
                         var_border_magnitudes,
-                        str(mean_motions_x) + "/" + str(transformed_motions_x),
-                        str(mean_motions_y) + "/" + str(transformed_motions_y),
+                        mean_motions_x,
+                        mean_motions_y,
+                        movement,
                     ]
                 )
 
@@ -482,6 +405,7 @@ def main():
             "border_variance",
             "average_motion_x",
             "average_motion_y",
+            "movement",
         ],
     )
 
@@ -496,8 +420,12 @@ def main():
             if existing_df["filename"].isin([row["filename"]]).any():
                 # For each column in the row
                 for col in new_df.columns:
-                    # If the new data for the column is not nan, update the existing data
-                    if pd.notna(row[col]):
+                    # round only numeric data
+                    if isinstance(row[col], (int, float)):
+                        existing_df.loc[
+                            existing_df["filename"] == row["filename"], col
+                        ] = round(row[col], 3)
+                    else:
                         existing_df.loc[
                             existing_df["filename"] == row["filename"], col
                         ] = row[col]
@@ -516,7 +444,6 @@ def main():
                 existing_df = pd.concat([existing_df, row_df])
 
         # Write the updated DataFrame back to the csv file
-        existing_df = existing_df.round(3)
         existing_df.sort_values("filename").to_csv(csv, index=False)
 
     else:
